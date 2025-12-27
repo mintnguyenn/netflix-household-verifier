@@ -1,0 +1,12 @@
+# secrets
+data/*.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# editor
+.vscode/
+.idea/
