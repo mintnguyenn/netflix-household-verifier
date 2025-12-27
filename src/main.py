@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import base64, re, logging
+import base64, logging, re, requests
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
@@ -45,8 +45,16 @@ class GmailClient:
         self.config = config
         self.service = self._authenticate()
 
+
     def _authenticate(self):
         """Authenticate with Gmail API using OAuth2."""
+        # Validate credentials file exists
+        if not Path(self.config.credentials_file).exists():
+            raise FileNotFoundError(
+                f"Credentials file not found: {self.config.credentials_file}\n"
+                "Please ensure credentials.json is exits and located in the data/ folder."
+            )
+
         creds = None
 
         # Load existing token if available
@@ -75,6 +83,7 @@ class GmailClient:
 
         logger.info("Gmail authentication successful")
         return build("gmail", "v1", credentials=creds)
+
 
     def _extract_body_parts(self, payload: dict, mime_types: list[str]) -> dict[str, str]:
         """
@@ -106,10 +115,11 @@ class GmailClient:
                 stack.append(child)
 
         return bodies
-    
+
+
     def get_email_headers(self, msg_id: str) -> dict[str, str]:
-        """Get message metadata (From, Subject, Date)."""
-        logger.debug(f"Fetching headers for message {msg_id}")
+        """Get email metadata (From, Subject, Date)."""
+        logger.debug(f"Fetching headers for email {msg_id}")
         msg = (
             self.service.users()
             .messages()
@@ -124,6 +134,7 @@ class GmailClient:
 
         headers = msg.get("payload", {}).get("headers", [])
         return {h["name"]: h["value"] for h in headers}
+
 
     def get_email_body(self, msg_id: str, mime_types: Optional[list[str]] = None) -> dict[str, str]:
         """
@@ -152,6 +163,7 @@ class GmailClient:
 
         return {k: v or "" for k, v in bodies.items()}
 
+
     def check_email_criteria(self, msg_id: str, subject_text: str, body_text: str) -> bool:
         """
         Check if an email matches criteria on 2 levels:
@@ -166,7 +178,7 @@ class GmailClient:
         Returns:
             True if both subject and body match, False otherwise
         """
-        logger.debug(f"Checking email {msg_id}")
+        logger.debug(f"Checking email [{msg_id}]")
 
         # Get headers
         headers = self.get_email_headers(msg_id)
@@ -180,20 +192,21 @@ class GmailClient:
             )
             return False
 
-        logger.info(f"Subject matches: {subject}")
+        logger.info(f"Email [{msg_id}] matches subject '{subject}'")
 
-        # Level 2: Check body (slower - needs to fetch full message)
+        # Level 2: Check body (slower - needs to fetch full email)
         logger.debug(f"Checking body for: '{body_text}'")
         bodies = self.get_email_body(msg_id)
         html_body = bodies.get("text/html", "")
 
         found = body_text in html_body
         if found:
-            logger.info(f"Body contains: '{body_text}'")
+            logger.info(f"Email [{msg_id}] contains: '{body_text}'")
         else:
-            logger.debug(f"Body doesn't contain: '{body_text}'")
+            logger.info(f"Email [{msg_id}] doesn't contain: '{body_text}'")
 
         return found
+
 
     def get_unread_emails(self, max_results: int = 5) -> list[dict]:
         """
@@ -215,7 +228,7 @@ class GmailClient:
             logger.info("No unread email")
             return []
 
-        logger.debug(f"Found {len(messages)} unread email(s)")
+        logger.info(f"Found {len(messages)} unread email(s)")
         results = []
         for m in messages:
             headers = self.get_email_headers(m["id"])
@@ -229,6 +242,7 @@ class GmailClient:
 
         return results
 
+
     def mark_as_read(self, msg_id: str) -> None:
         """Mark a message as read."""
         logger.debug(f"Marking message {msg_id} as read")
@@ -236,27 +250,28 @@ class GmailClient:
             userId="me", id=msg_id, body={"removeLabelIds": ["UNREAD"]}
         ).execute()
 
+
     def extract_household_verification_link(self, msg_id: str) -> str | None:
         """
-        Extract Netflix household link from message body.
+        Extract Netflix household verification link from message body.
 
         Args:
             msg_id: Gmail message ID
 
         Returns:
-            Netflix household link if found, None otherwise
+            Netflix household verification link if found, None otherwise
         """
-        logger.debug(f"Extracting household link from message {msg_id}")
+        logger.debug(f"Extracting household verification link from message {msg_id}")
         bodies = self.get_email_body(msg_id)
 
         # Search in both plain text and HTML
         for body_text in [bodies.get("text/plain", ""), bodies.get("text/html", "")]:
             if match := HOUSEHOLD_LINK_RE.search(body_text):
                 link = match.group(0)
-                logger.info(f"Found household link: {link}")
+                logger.info(f"Found household verification link: {link}")
                 return link
 
-        logger.debug("No household link found in message")
+        logger.debug("No household verification link found in message")
         return None
 
 
@@ -275,29 +290,38 @@ def main(debug: bool = False, info: bool = False):
     config = GmailConfig()
     client = GmailClient(config)
 
-    if info or debug:
-        logger.info("Starting Gmail check")
-
     # Get unread emails
     messages = client.get_unread_emails(max_results=5)
     for msg in messages:
         if info or debug:
-            logger.info(
-                f"From: {msg['from']} | Subject: {msg['subject']} | Date: {msg['date']}"
+            logger.debug(
+                f"Subject: {msg['subject']} | Date: {msg['date']}"
             )
 
         # Check this email
         result = client.check_email_criteria(
             msg_id=msg["id"],
             subject_text="Important: How to update your Netflix household",
-            body_text="Requested by TT",
+            body_text="Requested by Mom",
         )
 
         if result:
             # Extract the household link
             link = client.extract_household_verification_link(msg["id"])
             if link:
-                client.mark_as_read(msg["id"])
+                try:
+                    response = requests.get(link, timeout=20)
+                    response.raise_for_status()  # Raises HTTPError for bad status codes
+                    logger.info(f"Successfully accessed verification link: {response.status_code}")
+                    client.mark_as_read(msg["id"])
+                except requests.exceptions.Timeout:
+                    logger.error("Request timed out")
+                except requests.exceptions.HTTPError as e:
+                    logger.error(f"HTTP error: {e.response.status_code}")
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request failed: {e}")
+
+                return
 
 
 if __name__ == "__main__":
